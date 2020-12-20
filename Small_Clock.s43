@@ -1,0 +1,440 @@
+;*******************************************************************************
+;	Make a 12 hour clock using the MSP430G2231
+;       Send output to 3 dot matrix LED displays
+;       using Maxim MAX7219 command set
+;       ACLK = 32kHz, MCLK = SMCLK = Default DCO
+;       R7 = BCD time
+;       R8 = Seconds
+;       R9 = Row counter
+;       R10, R11, R12, R13 = temporary storage
+;       R14 = Display row buildup
+;       R15 = Display row buildup
+;
+;       Programmed by Jim MacKenzie in MSP430 assembly code with some
+;       code derived from samples provided by Texas Instruments
+;
+;                    MSP430G2231                                +5      Violet
+;                 -----------------                             +3.3    Red
+;           /|\  |              XIN|-                           Gnd     Orange
+;            |   |                 |  32kHz xtal
+;            +---|RST          XOUT|-
+;                |                 |
+;                |                 |
+;                |             P1.7|<- Serial Data In (SDI)
+;                |                 |
+;                |             P1.6|-> Serial Data Out (SDOO)           Yellow
+;                |                 |
+;                |             P1.5|-> Serial Clock (SCLK)              Brown
+;                |                 |
+;                |             P1.4|-> Chip Select (CS) Active Low      Green
+;                |                 |
+;                |             P1.3|-< Minutes Switch
+;                |                 |
+;                |             P1.2|-< Hours Switch
+;                |                 |
+;                |             P1.1|-< Hold Switch
+;                |                 |
+;                |             P1.0|-> LED Out
+;                 -----------------
+;
+;*******************************************************************************
+#include	<msp430g2231.h>			; Header file for this device 
+;*******************************************************************************
+LED1		EQU		BIT0		; AM/PM LED
+SW1             EQU             BIT1            ; Hold Time switch
+SW2             EQU             BIT2            ; Set Hours switch
+SW3             EQU             BIT3            ; Set Minutes switch
+;-------------------------------------------------------------------------------
+	RSEG	CSTACK				; Create stack (in RAM)
+;-------------------------------------------------------------------------------
+        RSEG    DATA16_N                	; Define data segment
+;-------------------------------------------------------------------------------
+	RSEG	CODE				; Define program segment
+;-------------------------------------------------------------------------------
+;       Presets for digits 0 to 9 and "Time?"
+;-------------------------------------------------------------------------------
+Zero    DB 00001110B
+        DB 00010001B
+        DB 00010011B
+        DB 00010101B
+        DB 00011001B
+        DB 00010001B
+        DB 00001110B
+        DB 00000000B
+One     DB 00000100B
+        DB 00001100B
+        DB 00000100B
+        DB 00000100B
+        DB 00000100B
+        DB 00000100B
+        DB 00001110B
+        DB 00000000B
+Two     DB 00001110B
+        DB 00010001B
+        DB 00000001B
+        DB 00001110B
+        DB 00010000B
+        DB 00010000B
+        DB 00011111B
+        DB 00000000B
+Three   DB 00001110B
+        DB 00010001B
+        DB 00000001B
+        DB 00000110B
+        DB 00000001B
+        DB 00010001B
+        DB 00001110B
+        DB 00000000B
+Four    DB 00000010B
+        DB 00000110B
+        DB 00001010B
+        DB 00010010B
+        DB 00011111B
+        DB 00000010B
+        DB 00000010B
+        DB 00000000B
+Five    DB 00011111B
+        DB 00010000B
+        DB 00011110B
+        DB 00000001B
+        DB 00000001B
+        DB 00010001B
+        DB 00001110B
+        DB 00000000B
+Six     DB 00001110B
+        DB 00010001B
+        DB 00010000B
+        DB 00011110B
+        DB 00010001B
+        DB 00010001B
+        DB 00001110B
+        DB 00000000B
+Seven   DB 00011111B
+        DB 00000001B
+        DB 00000010B
+        DB 00000100B
+        DB 00001000B
+        DB 00001000B
+        DB 00001000B
+        DB 00000000B
+Eight   DB 00001110B
+        DB 00010001B
+        DB 00010001B
+        DB 00001110B
+        DB 00010001B
+        DB 00010001B
+        DB 00001110B
+        DB 00000000B
+Nine    DB 00001110B
+        DB 00010001B
+        DB 00010001B
+        DB 00001111B
+        DB 00000001B
+        DB 00010001B
+        DB 00001110B
+        DB 00000000B
+Preset  DW 000FAH                               ; Row 1 (Top)
+        DW 0000EH
+        DW 00020H                               ; Row 2
+        DW 00011H
+        DW 00022H                               ; Row 3
+        DW 0D1C1H
+        DW 00022H                               ; Row 4
+        DW 0AA22H
+        DW 00022H                               ; Row 5
+        DW 0ABE4H
+        DW 00022H                               ; Row 6
+        DW 0AA00H
+        DW 00022H                               ; Row 7
+        DW 0A9C4H
+        DW 00000H                               ; Row 8 (Bottom)
+        DW 00000H     
+;*******************************************************************************
+;			Execution starts here		
+;*******************************************************************************
+Reset     mov.w         #0280h,SP		; Initialize stack pointer
+;*******************************************************************************
+;	Initialize ports P1.0 (LED) P1.1 through P1.3 (Switches) and P1.4 (CS!)
+;*******************************************************************************
+          bis.b         #LED1,&P1DIR            ; Set P1.0 to output
+          bis.b         #LED1,&P1OUT            ; Preset AM/PM LED off
+          bis.b         #010h,&P1DIR            ; P1.4 output
+          bis.b         #010h,&P1OUT            ; Set P1.4 high
+;*******************************************************************************
+; Set up watchdog timer for 1 second
+;*******************************************************************************
+          mov.w         #WDT_ADLY_1000,&WDTCTL 	; Set watchdog timer (1 Hz)
+          bis.b         #WDTIE,&IE1             ; Enable WDT interrupt
+          bis.b         #GIE,SR                 ; Enable all interrupts
+          clr.w         R8                      ; Clear the seconds counter
+;*******************************************************************************
+; Set up USI: SPI Mode 0, SMCLOCK/32, Master, 16 bit transfer, no interrupt
+;*******************************************************************************
+SetupUSI  bis.b         #USIPE7+USIPE6+USIPE5+USIMST+USIOE,&USICTL0; SPI master
+          bis.b         #USICKPH, &USICTL1      ; Clock data on rising edge
+          mov.b         #USIDIV_5+USISSEL_2, &USICKCTL       ; /32 SMCLK
+          mov.b         #USI16B, &USICNT        ; Enable 16 bit transfers
+          bic.b         #USISWRST,&USICTL0      ; Enable USI
+          mov.w         #0000h, R7              ; Set BCD time to 00:00
+;*******************************************************************************
+;       Initialize LED display to normal operation and no digit decode
+;       Start with a short delay for display to finish its power-on reset
+;*******************************************************************************
+Delay1    mov.w         #0FFFFH, R10            ; Use R10 as a counter
+          dec.w         R10                     ; Check counter
+          jz            Delay1                  ; Keep looping until non-zero
+          clr.w         R11                     ; NOP to clear SPI register
+          bic.b         #010h, &P1OUT           ; Set CS low
+          call          #Send_3                 ; Output R11 on SPI Port
+          bis.b         #010h, &P1OUT           ; Set CS high
+          call          #Delay                  ; Wait 100 clock cycles
+          bic.b         #010h, &P1OUT           ; Set CS low
+          mov.w         #0C01h, R11             ; Exit LED Shutdown mode
+          call          #Send_3                 ; Output on SPI Port
+          bis.b         #010h, &P1OUT           ; Set CS high
+          call          #Delay                  ; Wait 100 clock cycles
+          mov.w         #0900h, R11             ; Set no LED digit decode
+          bic.b         #010h, &P1OUT           ; Set CS low
+          call          #Send_3                 ; Output on SPI Port
+          bis.b         #010h, &P1OUT           ; Set CS high
+          call          #Delay                  ; Wait 100 clock cycles
+          mov.w         #0A05h, R11             ; Set medium LED intensity
+          bic.b         #010h, &P1OUT           ; Set CS low
+          call          #Send_3                 ; Output on SPI Port
+          bis.b         #010h, &P1OUT           ; Set CS high
+          call          #Delay                  ; Wait 100 clock cycles
+          mov.w         #0B07h, R11             ; set to display 8 columns
+          bic.b         #010h, &P1OUT           ; Set CS low
+          call          #Send_3                 ; Output on SPI Port
+          bis.b         #010h, &P1OUT           ; Set CS high
+          call          #Delay                  ; Wait 100 clock cycles
+;*******************************************************************************
+;       Preset display to show "Time?"
+;       Uses R12 as a row counter and data pointer
+;       Display data is moved into R14 and R15
+;       R9 points to the display row
+;       R10 is used for temporary storage
+;*******************************************************************************
+          mov.w         #08, R12                ; Point to row 8 (bottom)
+Loop_1    dec.w         R12                     ; Turn into index
+          mov.w         R12, R10                ;
+          rla.w         R10                     ; Multiply by 2
+          rla.w         R10                     ; Multiply by 2
+          mov.w         Preset(R10), R14        ; Get top 2 bytes
+          add.w         #02, R10                ; Add word offset
+          mov.w         Preset(R10), R15        ; Get bottom 2 bytes
+          mov.w         R12, R9
+          inc.w         R9                      ; Point to display row
+          call          #Send_Row               ; Output on SPI Port
+          call          #Delay                  ; Wait 100 clock cycles
+          tst.w         R12                     ; Test if done
+          jnz           Loop_1                  ; No - do another row
+          xor.b         #LED1,&P1OUT		; Toggle Red LED
+;
+InfLoop   bis.b         #LPM0+GIE,SR            ; Put processor to sleep and
+                                                ; wait for WDT interrupt
+          nop                                   ; Required for debugger
+;*******************************************************************************
+;               Update display with new time
+;               R7 holds BCD time
+;               Uses R9 to count rows
+;               Uses R10 and R13 for temporary storage
+;               Build display row in R14 and R15
+;               then call Send_Row to sent it out
+;*******************************************************************************
+          mov.w         #08, R9                 ; Set row to 8
+          bic.b         #20h, &P1OUT            ; Set CS low
+          mov.w		R9, R11		        ; Get row number
+          swpb		R11			; Turn into an LED command
+          call          #Send_3                 ; Send to 3 displays
+          bis.b         #010h, &P1OUT           ; Set CS high
+          call          #Delay                  ; Wait 100 clock cycles
+Do_Row    dec.w         R9                      ; Point to next row
+          mov.w         R7, R13                 ; Get BCD time
+          clr.w         R14
+          clr.w         R15                     ; Clear row
+          bit.w         #01000h, R13            ; Test for leading 1
+          jne           Ld_One                  ; Skip if one
+          call          #Get_Next               ; Get first digit
+          jmp           Ld_Zero                 ; Throw it away
+Ld_One    call          #Get_Next               ; Get first digit
+          mov.b         R12, R14                ; Save it to row
+Ld_Zero   call          #Get_Next               ; Get second digit
+          mov.b         R12, R15                ; Move to row
+          rla.w         R15
+          rla.w         R15                     ; Make room for colon
+          cmp.b         #05, R9                 ; Test if row 5
+          jne           No_Dot_1                ; Skip if not
+          inc.w         R15                     ; Add dot for colon
+No_Dot_1  cmp.b         #03, R9                 ; Test if row 3
+          jne           No_Dot_2                ; Skip if not
+          inc.w         R15                     ; Add dot for colon
+No_Dot_2  swpb          R15                     ; Move digit to top byte
+          call          #Get_Next               ; Get third digit
+          rla.w         R12
+          rla.w         R12                     ; Move into place
+          add.w         R12, R15                ; Add to line
+          clrc
+          rlc.w         R15
+          rlc.w         R14
+          rlc.w         R15
+          rlc.w         R14                     ; Rotate R14 and R15 left 4
+          rlc.w         R15
+          rlc.w         R14
+          rlc.w         R15
+          rlc.w         R14
+          call          #Get_Next               ; Get fourth digit
+          add.w         R12, R15                ; Add it to line
+          bit.w         #01000h, R7             ; Test for leading 1
+          jnz           All_Done                ; Jump if 1
+          clrc
+          rlc.w         R15                     ; Rotate R14 and R15 left 2
+          rlc.w         R14
+          rlc.w         R15
+          rlc.w         R14                     
+All_Done  call          #Send_Row               ; Send row to display
+          tst.w         R9                      ; Test if all rows are done
+          jnz           Do_Row                  ; No - do another
+          jmp           InfLoop
+;
+;*******************************************************************************
+;
+;                       Subroutines
+;
+;*******************************************************************************
+;       Subroutine to copy display row in R14 and R15 into 3 LED displays
+;       Row number is in R9
+;       R10, R11, R12 and R13 are used for temporary storage
+;*******************************************************************************
+Send_Row  bic.b         #010h, &P1OUT           ; Set CS low
+          mov.w		R9, R11		        ; Get row number
+          swpb		R11			; Turn into an LED command
+          mov.b		R14, R13	        ; Get first display row data
+          add.w         R13, R11                ; Add to command
+          call          #Send_16                ; Output R11 on SPI Port
+          mov.w		R9, R11		        ; Get row number
+          swpb		R11			; Turn into an LED command
+          mov.w         R15, R13                ; Get second display row data
+          swpb          R13                     ; Into first byte of R13
+          and.w         #0FFh, R13              ; Remove top byte
+          add.w         R13, R11                ; Add to command
+          call          #Send_16                ; Output on SPI Port
+          mov.w		R9, R11		        ; Get row number
+          swpb		R11			; Turn into an LED command
+          mov.w         R15, R13                ; Get third display row data
+          and.w         #0FFh, R13              ; Remove top byte
+          add.w         R13, R11                ; Add to command
+          call          #Send_16                ; Output on SPI Port
+          bis.b         #010h, &P1OUT           ; Set CS high
+          call          #Delay                  ; Wait 100 clock cycles
+          ret
+;*******************************************************************************
+;       Subroutine to pull next BCD number from R13 and convert
+;       to a byte of display data for a given row
+;       R9 holds row number (unchanged)
+;       R10 and R11 are used for temporary storage
+;       R12 returns one byte of character data
+;       R13 is shifted left by 4 bits
+;       R14 and R15 are preserved
+;*******************************************************************************
+Get_Next    rlc.w   R13                         ; Start with 4 BCD numbers
+            rlc.w   R13
+            rlc.w   R13                         ; Rotate top nibble
+            rlc.w   R13                         ; of R13 into bottom
+            rlc.w   R13                         ; nibble, through carry
+            mov.w   R13, R10                    ; Get next BCD digit
+            rrc.w   R13                         ; Restore bit 31 from carry
+            and.w   #0000FH, R10                ; Keep bottom nibble
+            rla.b   R10                         ;
+            rla.b   R10                         ; Multiply by 8
+            rla.b   R10                         ;
+            mov.w   R9, R11                     ; Get row number
+            dec.w   R11                         ; Set to row number minus 1
+            add.w   R11, R10                    ; Add to BCD value
+            clr.w   R12
+            mov.b   Zero(R10), R12              ; Move row data into R12 
+            ret
+;
+;*******************************************************************************
+;       Subroutine to output contents of R11 on the SPI Port, three times
+;       Returns last SPI input in R13
+;       CS set and cleared, externally
+;*******************************************************************************
+Send_3    call          #Send_16                ; Output R11 on SPI Port
+          call          #Send_16                ; Output again
+          call          #Send_16                ; Output again
+          ret
+;*******************************************************************************
+;       Subroutine to output contents of R11 on the SPI Port
+;       Returns SPI input in R13
+;       CS set and cleared, externally
+;*******************************************************************************
+Send_16   mov.w         R11, &USISR             ; Copy data into shift reg
+          mov.b         #050h, &USICNT          ; Transfer 16 bits
+Not_Yet   bit.b         #01h, &USICTL1          ; All 16 bits sent?
+          jeq           Not_Yet                 ; No - test again
+          mov.w         &USISR, R13             ; Read to clear USISR flags
+          ret
+;*******************************************************************************
+;       Subroutine to delay by 100 clock cycles
+;*******************************************************************************
+Delay     mov.w         #0100, R13              ; Cycle count = 100
+Delay2    dec.w         R13                     ; Count down
+          jnz           Delay2
+          ret
+;*******************************************************************************
+; Interrupt service routine for watchdog timert
+; Interrupt flag cleared automatically
+; Test for any switch depression
+; If not depressed, update time
+; If depressed, update minutes or seconds,
+; then clear LPM0 to restart main loop to update time
+;*******************************************************************************
+;
+WDT_ISR   bit.b         #SW1, &P1IN		; Test hold switch
+          jnz           TestSW2                 ; Jump if switch open
+          clr.w         R8                      ; Set seconds to 00
+          reti                                  ; Exit ISR
+TestSW2   bit.b         #SW2, &P1IN		; Test hour switch
+          jnz           TestSW3                 ; Jump if switch open
+          jmp           IncHour                 ; Increment hours
+TestSW3   bit.b         #SW3, &P1IN		; Test minute switch
+          jnz           Done1                   ; Jump if switch open
+          setc                                  ; Set carry for next inst
+          dadc.w        R7                      ; Increment BCD minutes
+          cmp.b         #060h, R7               ; 60 minutes?
+          jne           SndTime                 ; No - done
+          and.w         #0FF00h, R7             ; Yes - set minutes to 0
+          jmp           SndTime                 ; Done
+Done1     tst.w         R7                      ; Time = 00:00?
+          jz            Done4                   ; Yes - exit ISR
+          inc.w         R8                      ; Increment 1 second count
+          cmp.b         #060, R8                ; Count equal to 60?
+          jne           Done4                   ; No - exit ISR
+          clr.w         R8                      ; Yes - set seconds count to 0
+          setc                                  ; Set carry for next inst
+          dadc.w        R7                      ; Increment BCD minutes
+          cmp.b         #060h, R7               ; 60 minutes?
+          jne           SndTime                 ; No - done
+          and.w         #0FF00h, R7             ; Yes - set minutes to 0
+IncHour   swpb          R7                      ; Move hours into bottom byte
+          setc                                  ; Set carry for next inst
+          dadc.w        R7                      ; Increment BCD hours
+          cmp.b         #012h, R7               ; Hours equal to 12?
+          jne           Done2                   ; No - keep going
+          xor.b         #LED1,&P1OUT		; Toggle Red LED
+Done2     cmp.b         #013h, R7               ; 13 hours?
+          jne           Done3                   ; No - send to display
+          and.w         #0FF01h, R7             ; Yes - set hours to 1
+Done3     swpb          R7                      ; Restore time bytes
+SndTime   bic.w         #LPM0,0(SP)             ; Clear LPM0 to restart CPU
+                                                ; and update display
+Done4     reti        			        ; Exit ISR
+;*******************************************************************************
+	RSEG	INTVEC			        ; Segment for vectors
+;*******************************************************************************
+            ORG WDT_VECTOR      		; Watchdog timer (0FFF4h)
+            DW	WDT_ISR				; ISR for watchdog interrupt
+            ORG	RESET_VECTOR	                ; Reset (0FFFEh)
+            DW	Reset				; Address to start execution
+            END
